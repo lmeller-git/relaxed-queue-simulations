@@ -8,6 +8,9 @@ This repository contains a Rust project which can simulate rank errors of the se
 
 ## Usage
 
+Select the scheduler type you want to test in `main.rs`, then run the scripts in some way.
+Note that some options may require debug profile.
+
 To run, you need to set up a Rust environment with Cargo ([https://www.rust-lang.org/tools/install](https://www.rust-lang.org/tools/install)).
 
 Then, you can run simulations with `cargo run` (use also the `-r` flag for compiler optimizations). For example, with `cargo run -- -h` you see the different simulations available to run, and you can do a simple simulation of a single setting as follows:
