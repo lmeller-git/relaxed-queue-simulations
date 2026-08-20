@@ -1,19 +1,24 @@
 use std::{
-    collections::{BinaryHeap, HashSet},
+    collections::{BinaryHeap, HashSet, VecDeque},
     fs::{create_dir_all, File},
     io::Write,
     path::PathBuf,
     process,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use chrono::Local;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use rand::{seq::SliceRandom, thread_rng};
-use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
-use relaxation_analysis::{
-    analyze_distributions, analyze_minmax_gap, analyze_simple, DChoiceQueue,
+use kasino::{
+    components::PushPopCollection,
+    strategy::{DoubleCollect, RandomAccess, RoundRobin, Strategy, DCBO, DRA},
+    BoxedBandit, Collection, WithCapacity,
 };
+use rand::{rngs::SmallRng, seq::SliceRandom};
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use relaxation_analysis::analyze_simple;
+
+type Scheduler = DoubleCollect<DCBO>;
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -138,28 +143,6 @@ enum Test {
         #[arg(short, long, default_value_t = 1)]
         runs: usize,
     },
-
-    /// So far just does a single run, would like more
-    MinMaxGaps {
-        /// The number of operations to run
-        #[arg(short, long = "ops")]
-        operations: usize,
-
-        /// All numbers of bins to use
-        #[arg(short, long)]
-        bins: Vec<usize>,
-
-        /// The number of subqueues to sample for each operation (d).
-        #[arg(short = 'd', long, default_value_t = 2)]
-        sample_nbr: usize,
-
-        /// The name of the output json file, ends up at "results/{output_name}-{datetime}.json"
-        #[arg(long, default_value_t = format!("MinMaxGaps"))]
-        output_name: String,
-        // /// The number of runs to average over for each data point
-        // #[arg(short, long, default_value_t = 1)]
-        // runs: usize,
-    },
 }
 
 #[derive(Args, Debug)]
@@ -186,10 +169,6 @@ struct QueueConfig {
     /// What index sampling method to use
     #[arg(value_enum, long, default_value_t = Sampling::Naive)]
     sampling: Sampling,
-
-    /// What selection strategy to use for selecting sub-queue
-    #[arg(value_enum, long, default_value_t = QueueSelection::Random)]
-    selection: QueueSelection,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, ValueEnum)]
@@ -208,21 +187,6 @@ enum Sampling {
 
     /// Does not sample the same index twice
     Uniques,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, ValueEnum)]
-enum QueueSelection {
-    /// Uniformly random
-    Random,
-
-    /// Prefer queues to the left
-    Left,
-
-    /// Partition queues into d groups, sampling randomly per group, random tiebreak
-    RandomPart,
-
-    /// Partition queues into d groups, sampling randomly per group, and prefer left
-    LeftPart,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, ValueEnum)]
@@ -266,23 +230,58 @@ impl ErrorReadout {
 }
 
 impl QueueArg {
-    fn init(&self) -> DChoiceQueue<usize> {
+    fn init<S: Strategy<LockedDeque<usize>> + Default>(
+        &self,
+    ) -> BoxedBandit<LockedDeque<usize>, S> {
         self.config.init(self.subqueues)
     }
 }
 
 impl QueueConfig {
-    fn init(&self, subqueues: usize) -> DChoiceQueue<usize> {
-        DChoiceQueue::new(
-            subqueues,
-            self.sample_nbr,
-            self.sampling == Sampling::Uniques,
-            self.heuristic == Heuristic::Operation,
-            true,
-            self.selection == QueueSelection::RandomPart
-                || self.selection == QueueSelection::LeftPart,
-            self.selection == QueueSelection::Left || self.selection == QueueSelection::LeftPart,
-        )
+    fn init<S: Strategy<LockedDeque<usize>> + Default>(
+        &self,
+        subqueues: usize,
+    ) -> BoxedBandit<LockedDeque<usize>, S> {
+        BoxedBandit::new(subqueues)
+    }
+}
+
+pub(crate) struct LockedDeque<T> {
+    raw: Mutex<VecDeque<T>>,
+    // cap: usize,
+}
+
+impl<T> PushPopCollection for LockedDeque<T> {
+    type Item = T;
+
+    fn push(&self, item: Self::Item) -> Result<(), Self::Item> {
+        let mut lock = self.raw.lock().unwrap();
+        // if lock.len() >= self.cap {
+        //     return Err(item);
+        // }
+        lock.push_front(item);
+        Ok(())
+    }
+
+    fn pop(&self) -> Option<Self::Item> {
+        self.raw.lock().unwrap().pop_back()
+    }
+
+    fn len(&self) -> usize {
+        self.raw.lock().unwrap().len()
+    }
+
+    fn capacity(&self) -> usize {
+        self.raw.lock().unwrap().capacity()
+    }
+}
+
+impl<T, const N: usize> WithCapacity<N> for LockedDeque<T> {
+    fn with_capacity() -> Self {
+        Self {
+            raw: Mutex::new(VecDeque::with_capacity(N)),
+            // cap: N,
+        }
     }
 }
 
@@ -301,8 +300,9 @@ fn main() {
             error_readout,
         } => {
             let operations = gen_ops(operations_distribution, operations);
-            let mut queue = queue.init();
-            let avg_error = error_readout.readout(analyze_simple(&mut queue, prefill, &operations));
+            let mut queue = queue.init::<Scheduler>();
+            let avg_error =
+                error_readout.readout(analyze_simple(queue.buy_in(), prefill, &operations));
             println!("{avg_error}");
         }
         Test::OpsAndPrefill {
@@ -329,9 +329,12 @@ fn main() {
                         let mean: f32 = (0..runs)
                             .into_par_iter()
                             .map(|_| {
-                                let mut queue = shared_queue.init();
-                                let mean = error_readout
-                                    .readout(analyze_simple(&mut queue, *pre, &ops_vec));
+                                let mut queue = shared_queue.init::<Scheduler>();
+                                let mean = error_readout.readout(analyze_simple(
+                                    queue.buy_in(),
+                                    *pre,
+                                    &ops_vec,
+                                ));
                                 mean
                             })
                             .reduce(|| 0.0, |a, b| a + b)
@@ -385,8 +388,12 @@ fn main() {
                         let mean = (0..runs)
                             .into_par_iter()
                             .map(|_| {
-                                let mut queue = queue.init(*p);
-                                error_readout.readout(analyze_simple(&mut queue, *pre, &ops_vec))
+                                let mut queue = queue.init::<Scheduler>(*p);
+                                error_readout.readout(analyze_simple(
+                                    queue.buy_in(),
+                                    *pre,
+                                    &ops_vec,
+                                ))
                             })
                             .reduce(|| 0.0, |a, b| a + b)
                             / runs as f32;
@@ -424,147 +431,98 @@ fn main() {
             runs,
             operations_distribution,
         } => {
-            let ops_vec = gen_ops(operations_distribution, operations);
+            #[cfg(not(debug_assertions))]
+            return;
+            #[cfg(debug_assertions)]
+            {
+                let ops_vec = gen_ops(operations_distribution, operations);
 
-            // Average each data point in the distributions over all the runs
-            let mut rank_errors = vec![0f32; operations / 2];
-            let mut enq_deq_diffs = vec![0f32; operations / 2];
-            let mut subqueue_deq_diffs = vec![0f32; operations / 2];
-            let mut subqueue_enq_diffs = vec![0f32; operations / 2];
-            let mut subqueue_deq_counts = vec![0f32; queue.subqueues];
-            let mut subqueue_enq_counts = vec![0f32; queue.subqueues];
+                // Average each data point in the distributions over all the runs
+                let mut rank_errors = vec![0f32; operations / 2];
+                let mut enq_deq_diffs = vec![0f32; operations / 2];
+                let mut subqueue_deq_diffs = vec![0f32; operations / 2];
+                let mut subqueue_enq_diffs = vec![0f32; operations / 2];
+                let mut subqueue_deq_counts = vec![0f32; queue.subqueues];
+                let mut subqueue_enq_counts = vec![0f32; queue.subqueues];
 
-            let results: Vec<_> = (0..runs)
-                .into_par_iter()
-                .map(|_| {
-                    let mut queue = queue.init();
-                    analyze_distributions(&mut queue, prefill, &ops_vec)
-                })
-                .collect();
+                let results: Vec<_> = (0..runs)
+                    .into_par_iter()
+                    .map(|_| {
+                        use relaxation_analysis::analyze_distributions;
 
-            results.into_iter().for_each(
-                |(
-                    new_rank_errors,
-                    new_enq_deq_diffs,
-                    new_subqueue_deq_diffs,
-                    new_subqueue_enq_diffs,
-                    new_subqueue_enq_counts,
-                    new_subqueue_deq_counts,
-                )| {
-                    // Sum up all values in each x point
-                    for i in 0..rank_errors.len() {
-                        rank_errors[i] += new_rank_errors[i];
-                        enq_deq_diffs[i] += new_enq_deq_diffs[i];
-                        subqueue_deq_diffs[i] += new_subqueue_deq_diffs[i];
-                        subqueue_enq_diffs[i] += new_subqueue_enq_diffs[i];
-                    }
-                    for i in 0..queue.subqueues {
-                        subqueue_enq_counts[i] += new_subqueue_enq_counts[i];
-                        subqueue_deq_counts[i] += new_subqueue_deq_counts[i];
-                    }
-                },
-            );
+                        let mut queue = queue.init::<Scheduler>();
+                        analyze_distributions(&queue, prefill, &ops_vec)
+                    })
+                    .collect();
 
-            // Average the values
-            rank_errors
-                .iter_mut()
-                .for_each(|item| *item = *item / runs as f32);
-            enq_deq_diffs
-                .iter_mut()
-                .for_each(|item| *item = *item / runs as f32);
-            subqueue_deq_diffs
-                .iter_mut()
-                .for_each(|item| *item = *item / runs as f32);
-            subqueue_enq_diffs
-                .iter_mut()
-                .for_each(|item| *item = *item / runs as f32);
-            subqueue_deq_counts
-                .iter_mut()
-                .for_each(|item| *item = *item / runs as f32);
-            subqueue_enq_counts
-                .iter_mut()
-                .for_each(|item| *item = *item / runs as f32);
-
-            let string_keyed_results = [
-                ("Rank Errors", rank_errors),
-                ("Enq-Deq id difference", enq_deq_diffs),
-                ("Deq load offset", subqueue_deq_diffs),
-                ("Enq load offset", subqueue_enq_diffs),
-                ("Enqueue sub-queue counts", subqueue_enq_counts),
-                ("Dequeue sub-queue counts", subqueue_deq_counts),
-            ];
-
-            let serialized_output = serde_json::to_string_pretty(&string_keyed_results)
-                .expect("Could not serialize the output.");
-
-            let timestamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
-            // TODO: Don't always save it in results, in case we want to run from somewhere else
-            let folder = "results";
-            let path = PathBuf::from(folder).join(format!("{output_name}-{timestamp}.json"));
-
-            // Create directory and file
-            create_dir_all(folder).expect("Could not create the results dir");
-            let mut file = File::create(&path).expect("Failed to create file");
-            file.write_all(serialized_output.as_bytes())
-                .expect("Failed to write output to file");
-
-            println!("Writing output to: {}", path.to_string_lossy());
-        }
-        Test::MinMaxGaps {
-            operations,
-            bins,
-            sample_nbr,
-            output_name,
-            // runs,
-        } => {
-            let (vec_ind, vec_mean, vec_max): (Vec<usize>, Vec<f32>, Vec<usize>) = bins
-                .par_iter()
-                .map(|bins| {
-                    let (_, max, mean) = analyze_minmax_gap(*bins, operations, sample_nbr);
-                    (*bins, mean, max)
-                })
-                // thread local
-                .fold(
-                    || (Vec::new(), Vec::new(), Vec::new()),
-                    |mut acc, (a, b, c)| {
-                        acc.0.push(a);
-                        acc.1.push(b);
-                        acc.2.push(c);
-                        acc
-                    },
-                )
-                // total reduction
-                .reduce(
-                    || (Vec::new(), Vec::new(), Vec::new()),
-                    |mut a, mut b| {
-                        a.0.append(&mut b.0);
-                        a.1.append(&mut b.1);
-                        a.2.append(&mut b.2);
-                        a
+                results.into_iter().for_each(
+                    |(
+                        new_rank_errors,
+                        new_enq_deq_diffs,
+                        new_subqueue_deq_diffs,
+                        new_subqueue_enq_diffs,
+                        new_subqueue_enq_counts,
+                        new_subqueue_deq_counts,
+                    )| {
+                        // Sum up all values in each x point
+                        for i in 0..rank_errors.len() {
+                            rank_errors[i] += new_rank_errors[i];
+                            enq_deq_diffs[i] += new_enq_deq_diffs[i];
+                            subqueue_deq_diffs[i] += new_subqueue_deq_diffs[i];
+                            subqueue_enq_diffs[i] += new_subqueue_enq_diffs[i];
+                        }
+                        for i in 0..queue.subqueues {
+                            subqueue_enq_counts[i] += new_subqueue_enq_counts[i];
+                            subqueue_deq_counts[i] += new_subqueue_deq_counts[i];
+                        }
                     },
                 );
 
-            let json_data = serde_json::json!({
-                "operations" : operations,
-                "bins": vec_ind,
-                "mean" : vec_mean,
-                "max": vec_max,
-            });
-            let serialized_output =
-                serde_json::to_string_pretty(&json_data).expect("Failed to serialize");
+                // Average the values
+                rank_errors
+                    .iter_mut()
+                    .for_each(|item| *item = *item / runs as f32);
+                enq_deq_diffs
+                    .iter_mut()
+                    .for_each(|item| *item = *item / runs as f32);
+                subqueue_deq_diffs
+                    .iter_mut()
+                    .for_each(|item| *item = *item / runs as f32);
+                subqueue_enq_diffs
+                    .iter_mut()
+                    .for_each(|item| *item = *item / runs as f32);
+                subqueue_deq_counts
+                    .iter_mut()
+                    .for_each(|item| *item = *item / runs as f32);
+                subqueue_enq_counts
+                    .iter_mut()
+                    .for_each(|item| *item = *item / runs as f32);
 
-            let timestamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
-            // TODO: Don't always save it in results, in case we want to run from somewhere else
-            let folder = "results";
-            let path = PathBuf::from(folder).join(format!("{output_name}-{timestamp}.json"));
+                let string_keyed_results = [
+                    ("Rank Errors", rank_errors),
+                    ("Enq-Deq id difference", enq_deq_diffs),
+                    ("Deq load offset", subqueue_deq_diffs),
+                    ("Enq load offset", subqueue_enq_diffs),
+                    ("Enqueue sub-queue counts", subqueue_enq_counts),
+                    ("Dequeue sub-queue counts", subqueue_deq_counts),
+                ];
 
-            // Create directory and file
-            create_dir_all(folder).expect("Could not create the results dir");
-            let mut file = File::create(&path).expect("Failed to create file");
-            file.write_all(serialized_output.as_bytes())
-                .expect("Failed to write output to file");
+                let serialized_output = serde_json::to_string_pretty(&string_keyed_results)
+                    .expect("Could not serialize the output.");
 
-            println!("Writing output to: {}", path.to_string_lossy());
+                let timestamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
+                // TODO: Don't always save it in results, in case we want to run from somewhere else
+                let folder = "results";
+                let path = PathBuf::from(folder).join(format!("{output_name}-{timestamp}.json"));
+
+                // Create directory and file
+                create_dir_all(folder).expect("Could not create the results dir");
+                let mut file = File::create(&path).expect("Failed to create file");
+                file.write_all(serialized_output.as_bytes())
+                    .expect("Failed to write output to file");
+
+                println!("Writing output to: {}", path.to_string_lossy());
+            }
         }
     }
 }
@@ -576,7 +534,7 @@ fn gen_ops(distr: OperationDistribution, operations: usize) -> Vec<bool> {
                 .take(operations / 2)
                 .chain(std::iter::repeat(false).take(operations / 2))
                 .collect();
-            ops_vec.shuffle(&mut thread_rng());
+            ops_vec.shuffle(&mut rand::rng());
             ops_vec
         }
         OperationDistribution::Alternating => (0..operations).map(|i| i % 2 == 0).collect(),

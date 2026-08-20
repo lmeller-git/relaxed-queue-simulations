@@ -1,6 +1,18 @@
-use rand::Rng;
+#[cfg(debug_assertions)]
+use std::ops::Deref;
 
-use crate::{analyze_extra, DChoiceQueue, ErrorTag};
+#[cfg(debug_assertions)]
+use kasino::{components::PushPopCollection, BoxedBandit};
+use kasino::{
+    strategy::{Hook, Hooked, InstrumentedState, Strategy},
+    Collection, WithCapacity,
+};
+#[cfg(debug_assertions)]
+use rand::RngExt;
+
+#[cfg(debug_assertions)]
+use crate::analyze_extra;
+use crate::ErrorTag;
 
 /// Analyze relaxation properties of a relaxed queue (passed empty)
 ///
@@ -13,12 +25,22 @@ use crate::{analyze_extra, DChoiceQueue, ErrorTag};
 ///     - The partial enqueue counts at the end. Subtracted by the mean load, and sorted in ascending order
 ///     - The partial dequeue counts at the end. Subtracted by the mean load, and sorted in ascending order
 /// )
-pub fn analyze_distributions(
-    relaxed_queue: &mut DChoiceQueue<usize>,
+#[cfg(debug_assertions)]
+pub fn analyze_distributions<
+    Q: PushPopCollection<Item = usize> + WithCapacity<SUB_CAP>,
+    S: Strategy<Q> + Default,
+    const SUB_CAP: usize,
+    T: Hook,
+>(
+    relaxed_queue: &BoxedBandit<Q, S, SUB_CAP>,
     prefill: usize,
     operations: &Vec<bool>,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
-    let extra_ops = rand::thread_rng().gen_range(0..relaxed_queue.nbr_subqueues());
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)
+where
+    <S::Gambler as Hooked>::Stake: Deref<Target = InstrumentedState<T>> + Clone,
+{
+    let mut root = relaxed_queue.new_root();
+    let extra_ops = rand::rng().random_range(0..root.nbr_subqueues());
     // A bit of a hack, but add some extra enqueue and dequeues at the end to get random mean values of loads
     let extended_operations = operations
         .iter()
@@ -27,7 +49,7 @@ pub fn analyze_distributions(
         .chain(std::iter::repeat(false).take(extra_ops))
         .collect();
 
-    let error_tags = analyze_extra(relaxed_queue, prefill, &extended_operations);
+    let error_tags = analyze_extra(root.fork(), prefill, &extended_operations);
 
     let mut rank_errors: Vec<usize> = error_tags.iter().map(|tag| tag.rank_error()).collect();
     rank_errors.sort();
@@ -47,7 +69,7 @@ pub fn analyze_distributions(
         .iter()
         .map(|tag| {
             // TODO: Should it be deq_nbr - 1? Too tired when writing
-            let mean = tag.deq_nbr() as f32 / relaxed_queue.nbr_subqueues() as f32;
+            let mean = tag.deq_nbr() as f32 / root.nbr_subqueues() as f32;
             tag.sub_nbr() as f32 - 1.0 - mean
         })
         .collect();
@@ -57,11 +79,9 @@ pub fn analyze_distributions(
         .iter()
         .filter_map(|tag| match tag {
             ErrorTag::ItemDequeue {
-                enq_nbr,
-                sub_nbr,
-                ..
+                enq_nbr, sub_nbr, ..
             } => {
-                let mean = *enq_nbr as f32 / relaxed_queue.nbr_subqueues() as f32;
+                let mean = *enq_nbr as f32 / root.nbr_subqueues() as f32;
                 Some(*sub_nbr as f32 - 1.0 - mean)
             }
             ErrorTag::EmptyDequeue { .. } => None,
@@ -69,7 +89,9 @@ pub fn analyze_distributions(
         .collect();
     subqueue_enq_diff.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-    let mut enqueue_counts = relaxed_queue.subqueue_enqueue_counts();
+    let state: Vec<&InstrumentedState<T>> = root.state().map(|i| i.deref()).collect();
+
+    let mut enqueue_counts = state.iter().map(|s| s.enq()).collect::<Vec<_>>();
     enqueue_counts.sort();
     let enqueue_avg =
         enqueue_counts.iter().cloned().sum::<usize>() as f32 / enqueue_counts.len() as f32;
@@ -78,7 +100,7 @@ pub fn analyze_distributions(
         .map(|val| val as f32 - enqueue_avg)
         .collect();
 
-    let mut dequeue_counts = relaxed_queue.subqueue_dequeue_counts();
+    let mut dequeue_counts = state.iter().map(|s| s.deq()).collect::<Vec<_>>();
     dequeue_counts.sort();
     let dequeue_avg =
         dequeue_counts.iter().cloned().sum::<usize>() as f32 / dequeue_counts.len() as f32;
@@ -96,4 +118,3 @@ pub fn analyze_distributions(
         dequeue_normlized_counts,
     )
 }
-

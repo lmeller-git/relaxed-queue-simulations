@@ -1,10 +1,20 @@
 use std::collections::VecDeque;
+#[cfg(debug_assertions)]
+use std::ops::Deref;
 
-use crate::{relaxed_fifo::RelaxedFifo, DChoiceQueue};
+use kasino::{
+    components::PushPopCollection,
+    strategy::{Hook, Hooked, InstrumentedState, Strategy},
+    BoxedBanditHandle, WithCapacity,
+};
 
 /// Analyze a relaxed queue (passed empty), returning all rank errors for the operations
-pub fn analyze_simple(
-    relaxed_queue: &mut impl RelaxedFifo<usize>,
+pub fn analyze_simple<
+    Q: PushPopCollection<Item = usize> + WithCapacity<SUB_CAP>,
+    S: Strategy<Q> + Default,
+    const SUB_CAP: usize,
+>(
+    mut relaxed_queue: BoxedBanditHandle<Q, S, SUB_CAP>,
     prefill: usize,
     operations: &Vec<bool>,
 ) -> Vec<usize> {
@@ -14,7 +24,7 @@ pub fn analyze_simple(
     for item in 0..prefill {
         // Prefill
         strict_queue.enqueue(item);
-        relaxed_queue.enqueue(item);
+        relaxed_queue.push(item);
     }
 
     let mut rank_errors = vec![];
@@ -24,11 +34,11 @@ pub fn analyze_simple(
         if *op {
             // Enqueue
             strict_queue.enqueue(enq_nbr);
-            relaxed_queue.enqueue(enq_nbr);
+            relaxed_queue.push(enq_nbr);
             enq_nbr += 1;
         } else {
             // Dequeue
-            if let Some(item) = relaxed_queue.dequeue() {
+            if let Some(item) = relaxed_queue.pop() {
                 rank_errors.push(strict_queue.relaxed_dequeue(item));
             } else {
                 // Treat empty returns as real operations (some queues might not be empty linearizable)
@@ -92,18 +102,27 @@ impl ErrorTag {
 }
 
 /// Analyze a relaxed queue (passed empty), returning rank error and extra information for all dequeues
-pub fn analyze_extra(
-    relaxed_queue: &mut DChoiceQueue<usize>,
+#[cfg(debug_assertions)]
+pub fn analyze_extra<
+    Q: PushPopCollection<Item = usize> + WithCapacity<SUB_CAP>,
+    S: Strategy<Q>,
+    const SUB_CAP: usize,
+    T: Hook,
+>(
+    mut relaxed_queue: BoxedBanditHandle<Q, S, SUB_CAP>,
     prefill: usize,
     operations: &Vec<bool>,
-) -> Vec<ErrorTag> {
+) -> Vec<ErrorTag>
+where
+    <S::Gambler as Hooked>::Stake: Deref<Target = InstrumentedState<T>> + Clone,
+{
     // Keep an ordered queue to the side
     let mut strict_queue = StrictQueue::new();
 
     for item in 0..prefill {
         // Prefill
         strict_queue.enqueue(item);
-        relaxed_queue.enqueue(item);
+        relaxed_queue.push(item);
     }
 
     let mut error_tags = vec![];
@@ -114,22 +133,22 @@ pub fn analyze_extra(
         if *op {
             // Enqueue
             strict_queue.enqueue(enq_nbr);
-            relaxed_queue.enqueue(enq_nbr);
+            relaxed_queue.push(enq_nbr);
             enq_nbr += 1;
         } else {
             // Dequeue
             deq_nbr += 1;
-            match relaxed_queue.dequeue_with_info() {
-                (Some(item), sub_nbr) => error_tags.push(ErrorTag::ItemDequeue {
+            match relaxed_queue.poll_with_info(()) {
+                (Ok(item), sub_nbr) => error_tags.push(ErrorTag::ItemDequeue {
                     rank_error: strict_queue.relaxed_dequeue(item),
                     enq_nbr: item,
                     deq_nbr,
-                    sub_nbr,
+                    sub_nbr: sub_nbr.poll_count(),
                 }),
-                (None, sub_nbr) => error_tags.push(ErrorTag::EmptyDequeue {
+                (Err(_), sub_nbr) => error_tags.push(ErrorTag::EmptyDequeue {
                     rank_error: strict_queue.len(),
                     deq_nbr,
-                    sub_nbr,
+                    sub_nbr: sub_nbr.poll_count(),
                 }),
             }
         }

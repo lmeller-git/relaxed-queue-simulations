@@ -1,4 +1,4 @@
-use rand::Rng;
+use rand::RngExt;
 use std::cmp::max;
 use std::collections::BTreeSet;
 
@@ -23,7 +23,7 @@ pub fn analyze_minmax_gap(buckets: usize, operations: usize, d: usize) -> (Vec<u
 
     for _t in 0..operations {
         let index = (0..d)
-            .map(|_| rand::thread_rng().gen_range(0..buckets))
+            .map(|_| rand::rng().random_range(0..buckets))
             .min_by_key(|i| bins[*i])
             .unwrap();
 
