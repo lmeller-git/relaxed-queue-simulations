@@ -5,7 +5,7 @@ use std::ops::Deref;
 use kasino::{components::PushPopCollection, BoxedBandit};
 use kasino::{
     strategy::{Hook, Hooked, InstrumentedState, Strategy},
-    Collection, WithCapacity,
+    WithCapacity,
 };
 #[cfg(debug_assertions)]
 use rand::RngExt;
@@ -37,10 +37,12 @@ pub fn analyze_distributions<
     operations: &Vec<bool>,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)
 where
-    <S::Gambler as Hooked>::Stake: Deref<Target = InstrumentedState<T>> + Clone,
+    <S::Gambler as Hooked>::Stake: Deref<Target = InstrumentedState<T>>,
+    for<'a> Vec<&'a InstrumentedState<T>>:
+        FromIterator<&'a <<S as Strategy<Q>>::Gambler as Hooked>::Stake>,
 {
-    let mut root = relaxed_queue.new_root();
-    let extra_ops = rand::rng().random_range(0..root.nbr_subqueues());
+    let mut root = relaxed_queue.buy_in();
+    let extra_ops = rand::rng().random_range(0..root.arm_count());
     // A bit of a hack, but add some extra enqueue and dequeues at the end to get random mean values of loads
     let extended_operations = operations
         .iter()
@@ -69,7 +71,7 @@ where
         .iter()
         .map(|tag| {
             // TODO: Should it be deq_nbr - 1? Too tired when writing
-            let mean = tag.deq_nbr() as f32 / root.nbr_subqueues() as f32;
+            let mean = tag.deq_nbr() as f32 / root.arm_count() as f32;
             tag.sub_nbr() as f32 - 1.0 - mean
         })
         .collect();
@@ -81,7 +83,7 @@ where
             ErrorTag::ItemDequeue {
                 enq_nbr, sub_nbr, ..
             } => {
-                let mean = *enq_nbr as f32 / root.nbr_subqueues() as f32;
+                let mean = *enq_nbr as f32 / root.arm_count() as f32;
                 Some(*sub_nbr as f32 - 1.0 - mean)
             }
             ErrorTag::EmptyDequeue { .. } => None,
@@ -91,7 +93,7 @@ where
 
     let state: Vec<&InstrumentedState<T>> = root.state().map(|i| i.deref()).collect();
 
-    let mut enqueue_counts = state.iter().map(|s| s.enq()).collect::<Vec<_>>();
+    let mut enqueue_counts = state.iter().map(|s| s.offer_count()).collect::<Vec<_>>();
     enqueue_counts.sort();
     let enqueue_avg =
         enqueue_counts.iter().cloned().sum::<usize>() as f32 / enqueue_counts.len() as f32;
@@ -100,7 +102,7 @@ where
         .map(|val| val as f32 - enqueue_avg)
         .collect();
 
-    let mut dequeue_counts = state.iter().map(|s| s.deq()).collect::<Vec<_>>();
+    let mut dequeue_counts = state.iter().map(|s| s.poll_count()).collect::<Vec<_>>();
     dequeue_counts.sort();
     let dequeue_avg =
         dequeue_counts.iter().cloned().sum::<usize>() as f32 / dequeue_counts.len() as f32;

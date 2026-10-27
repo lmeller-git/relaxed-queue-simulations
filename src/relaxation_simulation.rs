@@ -114,7 +114,7 @@ pub fn analyze_extra<
     operations: &Vec<bool>,
 ) -> Vec<ErrorTag>
 where
-    <S::Gambler as Hooked>::Stake: Deref<Target = InstrumentedState<T>> + Clone,
+    <S::Gambler as Hooked>::Stake: Deref<Target = InstrumentedState<T>>,
 {
     // Keep an ordered queue to the side
     let mut strict_queue = StrictQueue::new();
