@@ -387,6 +387,8 @@ dependencies = [
 [[package]]
 name = "kasino"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c924b3c254df02aad777b12b82db99afb135fa243735197809660167e459008"
 dependencies = [
  "crossbeam-utils",
  "loom",

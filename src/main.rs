@@ -461,7 +461,9 @@ fn main() {
                         use relaxation_analysis::analyze_distributions;
 
                         let mut queue = queue.init::<Scheduler>();
-                        analyze_distributions(&queue, prefill, &ops_vec)
+                        analyze_distributions::<LockedDeque<_>, Scheduler, _, _>(
+                            &queue, prefill, &ops_vec,
+                        )
                     })
                     .collect();
 

@@ -38,8 +38,6 @@ pub fn analyze_distributions<
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)
 where
     <S::Gambler as Hooked>::Stake: Deref<Target = InstrumentedState<T>>,
-    for<'a> Vec<&'a InstrumentedState<T>>:
-        FromIterator<&'a <<S as Strategy<Q>>::Gambler as Hooked>::Stake>,
 {
     let mut root = relaxed_queue.buy_in();
     let extra_ops = rand::rng().random_range(0..root.arm_count());
@@ -91,7 +89,10 @@ where
         .collect();
     subqueue_enq_diff.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-    let state: Vec<&InstrumentedState<T>> = root.state().map(|i| i.deref()).collect();
+    let state: Vec<&InstrumentedState<T>> = root
+        .state()
+        .map(|i| -> &InstrumentedState<T> { i })
+        .collect();
 
     let mut enqueue_counts = state.iter().map(|s| s.offer_count()).collect::<Vec<_>>();
     enqueue_counts.sort();
