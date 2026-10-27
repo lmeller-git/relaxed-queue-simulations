@@ -11,14 +11,21 @@ use chrono::Local;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use kasino::{
     components::PushPopCollection,
-    strategy::{DoubleCollect, RandomAccess, RoundRobin, Strategy, DCBO, DRA},
+    strategy::{
+        padded::{
+            type_eval::{Evaluate, Or},
+            RequiresPadding,
+        },
+        DoubleCollectPoll, Hook, Hooked, InstrumentedState, RandomAccess, RoundRobin, Strategy,
+        StrategyStakes, DCBO, DRA,
+    },
     BoxedBandit, Collection, WithCapacity,
 };
 use rand::{rngs::SmallRng, seq::SliceRandom};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use relaxation_analysis::analyze_simple;
 
-type Scheduler = DoubleCollect<DCBO>;
+type Scheduler = DoubleCollectPoll<DCBO>;
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -230,18 +237,21 @@ impl ErrorReadout {
 }
 
 impl QueueArg {
-    fn init<S: Strategy<LockedDeque<usize>> + Default>(
-        &self,
-    ) -> BoxedBandit<LockedDeque<usize>, S> {
+    fn init<S>(&self) -> BoxedBandit<LockedDeque<usize>, S>
+    where
+        S: Strategy<LockedDeque<usize>> + Default,
+        StrategyStakes<S, LockedDeque<usize>>: Default,
+    {
         self.config.init(self.subqueues)
     }
 }
 
 impl QueueConfig {
-    fn init<S: Strategy<LockedDeque<usize>> + Default>(
-        &self,
-        subqueues: usize,
-    ) -> BoxedBandit<LockedDeque<usize>, S> {
+    fn init<S>(&self, subqueues: usize) -> BoxedBandit<LockedDeque<usize>, S>
+    where
+        S: Strategy<LockedDeque<usize>> + Default,
+        StrategyStakes<S, LockedDeque<usize>>: Default,
+    {
         BoxedBandit::new(subqueues)
     }
 }
@@ -451,7 +461,9 @@ fn main() {
                         use relaxation_analysis::analyze_distributions;
 
                         let mut queue = queue.init::<Scheduler>();
-                        analyze_distributions(&queue, prefill, &ops_vec)
+                        analyze_distributions::<LockedDeque<_>, Scheduler, _, _>(
+                            &queue, prefill, &ops_vec,
+                        )
                     })
                     .collect();
 
